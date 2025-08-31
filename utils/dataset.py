@@ -20,10 +20,12 @@ class Dataset(data.Dataset):
 
         # Read labels
         labels = self.load_label(filenames)
-        self.labels = list(labels.values())
-        self.filenames = list(labels.keys())  # update
+        # Filter the loaded labels to only include the files we want
+        self.labels = [labels[k] for k in filenames if k in labels]
+        self.filenames = filenames # Use the passed-in filenames
         self.n = len(self.filenames)  # number of samples
-        self.indices = range(self.n)
+        self.indices = range(self.n) # Re-add this line
+
         # Albumentations (optional, only used if package is installed)
         self.albumentations = Albumentations()
 

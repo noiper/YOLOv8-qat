@@ -56,50 +56,36 @@ def train(args, params):
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr, last_epoch=-1)
 
     filenames = []
-    with open('../Dataset/COCO/train2017.txt') as reader:
+    with open('../datasets/coco/train2017.txt') as reader:
         for filename in reader.readlines():
             filename = filename.rstrip().split('/')[-1]
-            filenames.append('../Dataset/COCO/images/train2017/' + filename)
+            filenames.append('../datasets/coco/images/train2017/' + filename)
 
-    sampler = None
+    # --- REMOVE THIS ---
+    # filenames = filenames[:1000]  # Use only the first 1000 images
+    
     dataset = Dataset(filenames, args.input_size, params, True)
-
-    if args.distributed:
-        sampler = data.distributed.DistributedSampler(dataset)
-
-    loader = data.DataLoader(dataset, args.batch_size, sampler is None, sampler,
+    loader = data.DataLoader(dataset, args.batch_size, shuffle=True,
                              num_workers=8, pin_memory=True, collate_fn=Dataset.collate_fn)
-
-    if args.distributed:
-        # DDP mode
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-        model = torch.nn.parallel.DistributedDataParallel(module=model,
-                                                          device_ids=[args.local_rank],
-                                                          output_device=args.local_rank)
-
+    
     best = 0
     num_steps = len(loader)
     criterion = util.ComputeLoss(model, params)
     num_warmup = max(round(params['warmup_epochs'] * num_steps), 100)
     with open('weights/step.csv', 'w') as f:
-        if args.local_rank == 0:
-            writer = csv.DictWriter(f, fieldnames=['epoch',
-                                                   'box', 'cls',
-                                                   'Recall', 'Precision', 'mAP@50', 'mAP'])
-            writer.writeheader()
+        writer = csv.DictWriter(f, fieldnames=['epoch',
+                                                'box', 'cls',
+                                                'Recall', 'Precision', 'mAP@50', 'mAP'])
+        writer.writeheader()
         for epoch in range(args.epochs):
             model.train()
-            if args.distributed:
-                sampler.set_epoch(epoch)
             if args.epochs - epoch == 10:
                 loader.dataset.mosaic = False
 
             p_bar = enumerate(loader)
 
-            if args.local_rank == 0:
-                print(('\n' + '%10s' * 4) % ('epoch', 'memory', 'box', 'cls'))
-            if args.local_rank == 0:
-                p_bar = tqdm.tqdm(p_bar, total=num_steps)  # progress bar
+            print(('\n' + '%10s' * 4) % ('epoch', 'memory', 'box', 'cls'))
+            p_bar = tqdm.tqdm(p_bar, total=num_steps)  # progress bar
 
             optimizer.zero_grad()
             avg_box_loss = util.AverageMeter()
@@ -148,43 +134,41 @@ def train(args, params):
                     optimizer.zero_grad()
 
                 # Log
-                if args.local_rank == 0:
-                    memory = f'{torch.cuda.memory_reserved() / 1E9:.4g}G'  # (GB)
-                    s = ('%10s' * 2 + '%10.3g' * 2) % (f'{epoch + 1}/{args.epochs}', memory,
-                                                       avg_box_loss.avg, avg_cls_loss.avg)
-                    p_bar.set_description(s)
+                memory = f'{torch.cuda.memory_reserved() / 1E9:.4g}G'  # (GB)
+                s = ('%10s' * 2 + '%10.3g' * 2) % (f'{epoch + 1}/{args.epochs}', memory,
+                                                    avg_box_loss.avg, avg_cls_loss.avg)
+                p_bar.set_description(s)
 
             # Scheduler
             scheduler.step()
 
-            if args.local_rank == 0:
-                # Convert model
-                save = copy.deepcopy(model.module if args.distributed else model)
-                save.eval()
-                save.to(torch.device('cpu'))
-                torch.ao.quantization.convert(save, inplace=True)
-                # mAP
-                last = test(args, params, save)
+            # Convert model
+            save = copy.deepcopy(model)
+            save.eval()
+            save.to(torch.device('cpu'))
+            torch.ao.quantization.convert(save, inplace=True)
+            # mAP
+            last = test(args, params, save)
 
-                writer.writerow({'epoch': str(epoch + 1).zfill(3),
-                                 'box': str(f'{avg_box_loss.avg:.3f}'),
-                                 'cls': str(f'{avg_cls_loss.avg:.3f}'),
-                                 'mAP': str(f'{last[0]:.3f}'),
-                                 'mAP@50': str(f'{last[1]:.3f}'),
-                                 'Recall': str(f'{last[2]:.3f}'),
-                                 'Precision': str(f'{last[2]:.3f}')})
-                f.flush()
+            writer.writerow({'epoch': str(epoch + 1).zfill(3),
+                            'box': str(f'{avg_box_loss.avg:.3f}'),
+                            'cls': str(f'{avg_cls_loss.avg:.3f}'),
+                            'mAP': str(f'{last[0]:.3f}'),
+                            'mAP@50': str(f'{last[1]:.3f}'),
+                            'Recall': str(f'{last[2]:.3f}'),
+                            'Precision': str(f'{last[2]:.3f}')})
+            f.flush()
 
-                # Update best mAP
-                if last[0] > best:
-                    best = last[0]
+            # Update best mAP
+            if last[0] > best:
+                best = last[0]
 
-                # Save last, best and delete
-                save = torch.jit.script(save.cpu())
-                torch.jit.save(save, './weights/last.ts')
-                if best == last[0]:
-                    torch.jit.save(save, './weights/best.ts')
-                del save
+            # Save last, best and delete
+            save = torch.jit.script(save.cpu())
+            torch.jit.save(save, './weights/last.ts')
+            if best == last[0]:
+                torch.jit.save(save, './weights/best.ts')
+            del save
 
     torch.cuda.empty_cache()
 
@@ -192,10 +176,10 @@ def train(args, params):
 @torch.no_grad()
 def test(args, params, model=None):
     filenames = []
-    with open('../Dataset/COCO/val2017.txt') as reader:
+    with open('../datasets/coco/val2017.txt') as reader:
         for filename in reader.readlines():
             filename = filename.rstrip().split('/')[-1]
-            filenames.append('../Dataset/COCO/images/val2017/' + filename)
+            filenames.append('../datasets/coco/images/val2017/' + filename)
 
     dataset = Dataset(filenames, args.input_size, params, False)
     loader = data.DataLoader(dataset, args.batch_size // 2, False, num_workers=8,
@@ -272,33 +256,24 @@ def profile(args, params):
     macs, params = profile(model, inputs=(torch.zeros(shape),), verbose=False)
     macs, params = clever_format([macs, params], "%.3f")
 
-    if args.local_rank == 0:
-        print(f'MACs: {macs}')
-        print(f'Parameters: {params}')
+    print(f'MACs: {macs}')
+    print(f'Parameters: {params}')
 
 
 def main():
     parser = ArgumentParser()
     parser.add_argument('--input-size', default=640, type=int)
     parser.add_argument('--batch-size', default=32, type=int)
-    parser.add_argument('--local_rank', default=0, type=int)
     parser.add_argument('--epochs', default=20, type=int)
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--test', action='store_true')
 
     args = parser.parse_args()
 
-    args.local_rank = int(os.getenv('LOCAL_RANK', 0))
-    args.world_size = int(os.getenv('WORLD_SIZE', 1))
-    args.distributed = int(os.getenv('WORLD_SIZE', 1)) > 1
+    args.world_size = 1 # Set world size to 1 for single GPU
 
-    if args.distributed:
-        torch.cuda.set_device(device=args.local_rank)
-        torch.distributed.init_process_group(backend='nccl', init_method='env://')
-
-    if args.local_rank == 0:
-        if not os.path.exists('weights'):
-            os.makedirs('weights')
+    if not os.path.exists('weights'):
+        os.makedirs('weights')
 
     with open('utils/args.yaml', errors='ignore') as f:
         params = yaml.safe_load(f)
