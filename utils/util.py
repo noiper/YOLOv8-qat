@@ -58,7 +58,7 @@ def make_anchors(x, strides, offset=0.5):
         _, _, h, w = x[i].shape
         sx = torch.arange(end=w, device=x[i].device, dtype=x[i].dtype) + offset  # shift x
         sy = torch.arange(end=h, device=x[i].device, dtype=x[i].dtype) + offset  # shift y
-        sy, sx = torch.meshgrid(sy, sx)
+        sy, sx = torch.meshgrid(sy, sx, indexing='ij')
         anchors.append(torch.stack((sx, sy), -1).view(-1, 2))
         stride_tensor.append(torch.full((h * w, 1), stride, dtype=x[i].dtype, device=x[i].device))
     return torch.cat(anchors), torch.cat(stride_tensor)
@@ -94,7 +94,7 @@ def non_max_suppression(outputs, conf_threshold, iou_threshold, nc):
     max_nms = 30000
 
     shape = outputs[0].shape[0]
-    stride = torch.tensor([8.0, 16.0, 32.0])
+    stride = torch.tensor([8.0, 16.0, 32.0], device=outputs[0].device)
 
     anchors, strides = (x.transpose(0, 1) for x in make_anchors(outputs, stride, 0.5))
 
@@ -105,164 +105,117 @@ def non_max_suppression(outputs, conf_threshold, iou_threshold, nc):
     box = torch.cat(((a + b) / 2, b - a), dim=1)
     outputs = torch.cat((box * strides, cls.sigmoid()), dim=1)
 
-    bs = outputs.shape[0]  # batch size
-    nc = outputs.shape[1] - 4  # number of classes
-    xc = outputs[:, 4:4 + nc].amax(1) > conf_threshold  # candidates
+    bs = outputs.shape[0]
+    nc = outputs.shape[1] - 4
+    xc = outputs[:, 4:4 + nc].amax(1) > conf_threshold
 
-    # Settings
     start_time = time()
-    time_limit = 0.5 + 0.05 * bs  # seconds to quit after
+    time_limit = 0.5 + 0.05 * bs
     nms_outputs = [torch.zeros((0, 6), device=outputs.device)] * bs
-    for index, output in enumerate(outputs):  # image index, image inference
-        output = output.transpose(0, -1)[xc[index]]  # confidence
+    for index, output in enumerate(outputs):
+        output = output.transpose(0, -1)[xc[index]]
 
-        # If none remain process next image
         if not output.shape[0]:
             continue
 
-        # Detections matrix nx6 (xyxy, conf, cls)
         box, cls = output.split((4, nc), 1)
-        box = wh2xy(box)  # center_x, center_y, width, height) to (x1, y1, x2, y2)
+        box = wh2xy(box)
         if nc > 1:
             i, j = (cls > conf_threshold).nonzero(as_tuple=False).T
             output = torch.cat((box[i], output[i, 4 + j, None], j[:, None].float()), 1)
-        else:  # best class only
+        else:
             conf, j = cls.max(1, keepdim=True)
             output = torch.cat((box, conf, j.float()), 1)[conf.view(-1) > conf_threshold]
 
-        # Check shape
-        n = output.shape[0]  # number of boxes
-        if not n:  # no boxes
+        n = output.shape[0]
+        if not n:
             continue
-        # sort by confidence and remove excess boxes
         output = output[output[:, 4].argsort(descending=True)[:max_nms]]
 
-        # Batched NMS
-        c = output[:, 5:6] * max_wh  # classes
-        boxes, scores = output[:, :4] + c, output[:, 4]  # boxes (offset by class), scores
-        i = torchvision.ops.nms(boxes, scores, iou_threshold)  # NMS
-        i = i[:max_det]  # limit detections
+        c = output[:, 5:6] * max_wh
+        boxes, scores = output[:, :4] + c, output[:, 4]
+        i = torchvision.ops.nms(boxes, scores, iou_threshold)
+        i = i[:max_det]
 
         nms_outputs[index] = output[i]
         if (time() - start_time) > time_limit:
-            break  # time limit exceeded
+            break
 
     return nms_outputs
 
 
 def smooth(y, f=0.05):
-    # Box filter of fraction f
-    nf = round(len(y) * f * 2) // 2 + 1  # number of filter elements (must be odd)
-    p = numpy.ones(nf // 2)  # ones padding
-    yp = numpy.concatenate((p * y[0], y, p * y[-1]), 0)  # y padded
-    return numpy.convolve(yp, numpy.ones(nf) / nf, mode='valid')  # y-smoothed
+    nf = round(len(y) * f * 2) // 2 + 1
+    p = numpy.ones(nf // 2)
+    yp = numpy.concatenate((p * y[0], y, p * y[-1]), 0)
+    return numpy.convolve(yp, numpy.ones(nf) / nf, mode='valid')
 
 
 def compute_ap(tp, conf, pred_cls, target_cls, eps=1E-16):
-    """
-    Compute the average precision, given the recall and precision curves.
-    Source: https://github.com/rafaelpadilla/Object-Detection-Metrics.
-    # Arguments
-        tp:  True positives (nparray, nx1 or nx10).
-        conf:  Object-ness value from 0-1 (nparray).
-        pred_cls:  Predicted object classes (nparray).
-        target_cls:  True object classes (nparray).
-    # Returns
-        The average precision
-    """
-    # Sort by object-ness
     i = numpy.argsort(-conf)
     tp, conf, pred_cls = tp[i], conf[i], pred_cls[i]
 
-    # Find unique classes
     unique_classes, nt = numpy.unique(target_cls, return_counts=True)
-    nc = unique_classes.shape[0]  # number of classes, number of detections
+    nc = unique_classes.shape[0]
 
-    # Create Precision-Recall curve and compute AP for each class
     p = numpy.zeros((nc, 1000))
     r = numpy.zeros((nc, 1000))
     ap = numpy.zeros((nc, tp.shape[1]))
-    px, py = numpy.linspace(0, 1, 1000), []  # for plotting
+    px = numpy.linspace(0, 1, 1000)
     for ci, c in enumerate(unique_classes):
         i = pred_cls == c
-        nl = nt[ci]  # number of labels
-        no = i.sum()  # number of outputs
+        nl = nt[ci]
+        no = i.sum()
         if no == 0 or nl == 0:
             continue
 
-        # Accumulate FPs and TPs
         fpc = (1 - tp[i]).cumsum(0)
         tpc = tp[i].cumsum(0)
 
-        # Recall
-        recall = tpc / (nl + eps)  # recall curve
-        # negative x, xp because xp decreases
+        recall = tpc / (nl + eps)
         r[ci] = numpy.interp(-px, -conf[i], recall[:, 0], left=0)
 
-        # Precision
-        precision = tpc / (tpc + fpc)  # precision curve
-        p[ci] = numpy.interp(-px, -conf[i], precision[:, 0], left=1)  # p at pr_score
+        precision = tpc / (tpc + fpc)
+        p[ci] = numpy.interp(-px, -conf[i], precision[:, 0], left=1)
 
-        # AP from recall-precision curve
         for j in range(tp.shape[1]):
             m_rec = numpy.concatenate(([0.0], recall[:, j], [1.0]))
             m_pre = numpy.concatenate(([1.0], precision[:, j], [0.0]))
-
-            # Compute the precision envelope
             m_pre = numpy.flip(numpy.maximum.accumulate(numpy.flip(m_pre)))
+            x = numpy.linspace(0, 1, 101)
+            ap[ci, j] = numpy.trapz(numpy.interp(x, m_rec, m_pre), x)
 
-            # Integrate area under curve
-            x = numpy.linspace(0, 1, 101)  # 101-point interp (COCO)
-            ap[ci, j] = numpy.trapz(numpy.interp(x, m_rec, m_pre), x)  # integrate
-
-    # Compute F1 (harmonic mean of precision and recall)
     f1 = 2 * p * r / (p + r + eps)
-
-    i = smooth(f1.mean(0), 0.1).argmax()  # max F1 index
+    i = smooth(f1.mean(0), 0.1).argmax()
     p, r, f1 = p[:, i], r[:, i], f1[:, i]
-    tp = (r * nt).round()  # true positives
-    fp = (tp / (p + eps) - tp).round()  # false positives
-    ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
+    tp = (r * nt).round()
+    fp = (tp / (p + eps) - tp).round()
+    ap50, ap = ap[:, 0], ap.mean(1)
     m_pre, m_rec = p.mean(), r.mean()
     map50, mean_ap = ap50.mean(), ap.mean()
     return tp, fp, m_pre, m_rec, map50, mean_ap
 
 
 def compute_iou(box1, box2, eps=1E-7):
-    # Returns Intersection over Union (IoU) of box1(1,4) to box2(n,4)
-
-    # Get the coordinates of bounding boxes
     b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1)
     b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, -1)
-    w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
-    w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
+    w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1
+    w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1
 
-    # Intersection area
-    inter = (b1_x2.minimum(b2_x2) - b1_x1.maximum(b2_x1)).clamp(0) * \
-            (b1_y2.minimum(b2_y2) - b1_y1.maximum(b2_y1)).clamp(0)
+    inter = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0) * \
+            (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
 
-    # Union Area
     union = w1 * h1 + w2 * h2 - inter + eps
-
-    # IoU
     iou = inter / union
-    cw = b1_x2.maximum(b2_x2) - b1_x1.minimum(b2_x1)  # convex (smallest enclosing box) width
-    ch = b1_y2.maximum(b2_y2) - b1_y1.minimum(b2_y1)  # convex height
-    c2 = cw ** 2 + ch ** 2 + eps  # convex diagonal squared
-    rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2) ** 2 + (b2_y1 + b2_y2 - b1_y1 - b1_y2) ** 2) / 4  # center dist ** 2
-    # https://github.com/Zzh-tju/DIoU-SSD-pytorch/blob/master/utils/box/box_utils.py#L47
-    v = (4 / math.pi ** 2) * (torch.atan(w2 / h2) - torch.atan(w1 / h1)).pow(2)
+
+    cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)
+    ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)
+    c2 = cw ** 2 + ch ** 2 + eps
+    rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2) ** 2 + (b2_y1 + b2_y2 - b1_y1 - b1_y2) ** 2) / 4
+    v = (4 / math.pi ** 2) * torch.pow(torch.atan(w2 / (h2 + eps)) - torch.atan(w1 / (h1 + eps)), 2)
     with torch.no_grad():
         alpha = v / (v - iou + (1 + eps))
-    return iou - (rho2 / c2 + v * alpha)  # CIoU
-
-
-def strip_optimizer(filename):
-    x = torch.load(filename, map_location=torch.device('cpu'))
-    x['model'].half()  # to FP16
-    for p in x['model'].parameters():
-        p.requires_grad = False
-    torch.save(x, filename)
+    return iou - (rho2 / c2 + v * alpha)
 
 
 def clip_gradients(model, max_norm=10.0):
@@ -270,20 +223,8 @@ def clip_gradients(model, max_norm=10.0):
     torch.nn.utils.clip_grad_norm_(parameters, max_norm=max_norm)
 
 
-def load_weight(ckpt, model):
-    dst = model.state_dict()
-    src = torch.load(ckpt, 'cpu')['model'].float().state_dict()
-    ckpt = {}
-    for k, v in src.items():
-        if k in dst and v.shape == dst[k].shape:
-            ckpt[k] = v
-    model.load_state_dict(state_dict=ckpt, strict=False)
-    return model
-
-
 def weight_decay(model, decay):
-    p1 = []
-    p2 = []
+    p1, p2 = [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
@@ -291,79 +232,7 @@ def weight_decay(model, decay):
             p1.append(param)
         else:
             p2.append(param)
-    return [{'params': p1, 'weight_decay': 0.00},
-            {'params': p2, 'weight_decay': decay}]
-
-
-def export_onnx(model, args, filename):
-    model.eval()
-    import onnx  # noqa
-
-    inputs = ['images']
-    outputs = ['outputs']
-    dynamic = {'images': {0: 'batch', 2: 'height', 3: 'width'},
-               'outputs': {0: 'batch', 2: 'anchors'}}
-
-    x = torch.zeros((1, 3, args.input_size, args.input_size))
-
-    torch.onnx.export(model.cpu(), x.cpu(), filename,
-                      verbose=False,
-                      opset_version=13,
-                      dynamic_axes=dynamic,
-                      # WARNING: DNN inference with torch>=1.12 may require do_constant_folding=False
-                      do_constant_folding=True,
-                      input_names=inputs,
-                      output_names=outputs)
-
-def scale_coords(img1_shape, coords, img0_shape, ratio_pad=None):
-    # Rescale coords (xyxy) from img1_shape to img0_shape
-    if ratio_pad is None:  # calculate from img0_shape
-        gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])  # gain = old / new
-        pad = (img1_shape[1] - img0_shape[1] * gain) / 2, (img1_shape[0] - img0_shape[0] * gain) / 2  # wh padding
-    else:
-        gain = ratio_pad[0]
-        pad = ratio_pad[1]
-
-    coords[:, [0, 2]] -= pad[0]  # x padding
-    coords[:, [1, 3]] -= pad[1]  # y padding
-    coords[:, :4] /= gain
-
-    # Clip coordinates
-    coords[:, 0].clamp_(0, img0_shape[1])  # x1
-    coords[:, 1].clamp_(0, img0_shape[0])  # y1
-    coords[:, 2].clamp_(0, img0_shape[1])  # x2
-    coords[:, 3].clamp_(0, img0_shape[0])  # y2
-    return coords
-
-class EMA:
-    """
-    Updated Exponential Moving Average (EMA) from https://github.com/rwightman/pytorch-image-models
-    Keeps a moving average of everything in the model state_dict (parameters and buffers)
-    For EMA details see https://www.tensorflow.org/api_docs/python/tf/train/ExponentialMovingAverage
-    """
-
-    def __init__(self, model, decay=0.9999, tau=2000, updates=0):
-        # Create EMA
-        self.ema = copy.deepcopy(model).eval()  # FP32 EMA
-        self.updates = updates  # number of EMA updates
-        # decay exponential ramp (to help early epochs)
-        self.decay = lambda x: decay * (1 - math.exp(-x / tau))
-        for p in self.ema.parameters():
-            p.requires_grad_(False)
-
-    def update(self, model):
-        if hasattr(model, 'module'):
-            model = model.module
-        # Update EMA parameters
-        with torch.no_grad():
-            self.updates += 1
-            d = self.decay(self.updates)
-
-            msd = model.state_dict()  # model state_dict
-            for k, v in self.ema.state_dict().items():
-                if v.dtype.is_floating_point:
-                    v *= d
-                    v += (1 - d) * msd[k].detach()
+    return [{'params': p1, 'weight_decay': 0.0}, {'params': p2, 'weight_decay': decay}]
 
 
 class AverageMeter:
@@ -374,30 +243,9 @@ class AverageMeter:
 
     def update(self, v, n):
         if not math.isnan(float(v)):
-            self.num = self.num + n
-            self.sum = self.sum + v * n
+            self.num += n
+            self.sum += v * n
             self.avg = self.sum / self.num
-
-
-class YOLODetector:
-    def __init__(self, onnx_path=None, session=None):
-        self.session = session
-        from onnxruntime import InferenceSession
-
-        if self.session is None:
-            assert onnx_path is not None
-            self.session = InferenceSession(onnx_path,
-                                            providers=['CPUExecutionProvider'])
-
-        self.output_names = []
-        for output in self.session.get_outputs():
-            self.output_names.append(output.name)
-        self.input_name = self.session.get_inputs()[0].name
-
-    def __call__(self, x):
-
-        return self.session.run(self.output_names, {self.input_name: x})
-
 
 class Assigner:
     def __init__(self, top_k=13, num_classes=80, alpha=1.0, beta=6.0, eps=1e-9):
@@ -439,14 +287,15 @@ class Assigner:
         return mask_pos, align_metric, overlaps
 
     def get_box_metrics(self, pred_scores, pred_bboxes, gt_labels, gt_bboxes):
-        bs, n_max_boxes, _ = gt_labels.shape
+        """Compute alignment metric given predicted and ground truth boxes."""
         na = pred_bboxes.size(1)
+        bs, n_max_boxes, _ = gt_labels.shape
         
-        b_idx = torch.arange(bs, device=pred_scores.device).view(bs, 1, 1).expand(bs, n_max_boxes, na)
-        j_idx = torch.arange(na, device=pred_scores.device).view(1, 1, na).expand(bs, n_max_boxes, na)
-        class_idx = gt_labels.long().expand(bs, n_max_boxes, na)
-        bbox_scores = pred_scores[b_idx, j_idx, class_idx]
-
+        # CORRECTED: Use gather for robust indexing
+        pred_scores_expanded = pred_scores.unsqueeze(1).expand(-1, n_max_boxes, -1, -1)
+        gt_labels_expanded = gt_labels.long().expand(-1, -1, na).unsqueeze(-1)
+        bbox_scores = torch.gather(pred_scores_expanded, 3, gt_labels_expanded).squeeze(-1)
+        
         overlaps = compute_iou(gt_bboxes.unsqueeze(2).expand(-1, -1, na, -1), pred_bboxes.unsqueeze(1).expand(-1, n_max_boxes, -1, -1))
         align_metric = bbox_scores.pow(self.alpha) * overlaps.pow(self.beta)
         return align_metric, overlaps
