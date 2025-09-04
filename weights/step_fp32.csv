@@ -1,0 +1,2 @@
+epoch,box,cls,Recall,Precision,mAP@50,mAP
+001,3.360,1793.234,0.072,0.072,0.008,0.003
