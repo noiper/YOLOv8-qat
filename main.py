@@ -30,18 +30,19 @@ def train(args, params):
 
     # Model
     model = nn.yolo_v8_n(len(params['names']))
-    state = torch.load('./weights/v8_n.pth')['model']
-    model.load_state_dict(state.float().state_dict())
-    model.eval()
+    if not args.float:
+        state = torch.load('./weights/v8_n.pth')['model']
+        model.load_state_dict(state.float().state_dict())
+        model.eval()
 
-    for m in model.modules():
-        if type(m) is nn.Conv and hasattr(m, 'norm'):
-            torch.ao.quantization.fuse_modules(m, [["conv", "norm"]], True)
-    model.train()
+        for m in model.modules():
+            if type(m) is nn.Conv and hasattr(m, 'norm'):
+                torch.ao.quantization.fuse_modules(m, [["conv", "norm"]], True)
+        model.train()
 
-    model = nn.QAT(model)
-    model.qconfig = torch.quantization.get_default_qconfig("qnnpack")
-    torch.quantization.prepare_qat(model, inplace=True)
+        model = nn.QAT(model)
+        model.qconfig = torch.quantization.get_default_qconfig("qnnpack")
+        torch.quantization.prepare_qat(model, inplace=True)
     model.cuda()
 
     # Optimizer
@@ -146,7 +147,8 @@ def train(args, params):
             save = copy.deepcopy(model)
             save.eval()
             save.to(torch.device('cpu'))
-            torch.ao.quantization.convert(save, inplace=True)
+            if not args.float:
+                torch.ao.quantization.convert(save, inplace=True)
             # mAP
             last = test(args, params, save)
 
@@ -267,6 +269,7 @@ def main():
     parser.add_argument('--epochs', default=20, type=int)
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--test', action='store_true')
+    parser.add_argument('--float', action='store_true')
 
     args = parser.parse_args()
 

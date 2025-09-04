@@ -10,7 +10,10 @@ class SiLU(torch.nn.Module):
         self.float_fn = torch.nn.quantized.FloatFunctional()
 
     def forward(self, x):
-        return self.float_fn.mul(self.sigmoid(x), x)
+        if x.is_quantized:
+            return self.float_fn.mul(self.sigmoid(x), x)
+        else:
+            return torch.nn.functional.silu(x)
 
 
 class Conv(torch.nn.Module):
@@ -35,7 +38,13 @@ class Residual(torch.nn.Module):
     def forward(self, x):
         y = self.conv1(x)
         y = self.conv2(y)
-        return self.quant.add(x, y) if self.add_m else y
+        if self.add_m:
+            if x.is_quantized:
+                return self.quant.add(x, y)
+            else:
+                return x + y
+        else:
+            return y
 
 
 class CSP(torch.nn.Module):
@@ -49,7 +58,10 @@ class CSP(torch.nn.Module):
     def forward(self, x):
         y = list(self.conv1(x).chunk(2, 1))
         y.extend(m(y[-1]) for m in self.res_m)
-        return self.conv2(self.quant.cat(y, dim=1))
+        if x.is_quantized:
+            return self.conv2(self.quant.cat(y, dim=1))
+        else:
+            return self.conv2(torch.cat(y, dim=1))
 
 
 class SPP(torch.nn.Module):
@@ -64,7 +76,10 @@ class SPP(torch.nn.Module):
         x = self.conv1(x)
         y1 = self.res_m(x)
         y2 = self.res_m(y1)
-        return self.conv2(self.quant.cat([x, y1, y2, self.res_m(y2)], 1))
+        if x.is_quantized:
+            return self.conv2(self.quant.cat([x, y1, y2, self.res_m(y2)], 1))
+        else:
+            return self.conv2(torch.cat([x, y1, y2, self.res_m(y2)], 1))
 
 
 class DarkNet(torch.nn.Module):
@@ -120,10 +135,16 @@ class DarkFPN(torch.nn.Module):
         self.h6 = CSP(width[4] + width[5], width[5], depth[0], False)
 
     def forward(self, p3, p4, p5):
-        p4 = self.h1(self.fn.cat([self.up(p5), p4], 1))
-        p3 = self.h2(self.fn.cat([self.up(p4), p3], 1))
-        p4 = self.h4(self.fn.cat([self.h3(p3), p4], 1))
-        p5 = self.h6(self.fn.cat([self.h5(p4), p5], 1))
+        if p3.is_quantized:
+            p4 = self.h1(self.fn.cat([self.up(p5), p4], 1))
+            p3 = self.h2(self.fn.cat([self.up(p4), p3], 1))
+            p4 = self.h4(self.fn.cat([self.h3(p3), p4], 1))
+            p5 = self.h6(self.fn.cat([self.h5(p4), p5], 1))
+        else:
+            p4 = self.h1(torch.cat([self.up(p5), p4], 1))
+            p3 = self.h2(torch.cat([self.up(p4), p3], 1))
+            p4 = self.h4(torch.cat([self.h3(p3), p4], 1))
+            p5 = self.h6(torch.cat([self.h5(p4), p5], 1))
         return p3, p4, p5
 
 
@@ -150,7 +171,10 @@ class Head(torch.nn.Module):
     def forward(self, p3, p4, p5):
         x = [p3, p4, p5]
         for i, (box, cls) in enumerate(zip(self.box, self.cls)):
-            x[i] = self.fn.cat((box(x[i]), cls(x[i])), 1)
+            if x[i].is_quantized:
+                x[i] = self.fn.cat((box(x[i]), cls(x[i])), 1)
+            else:
+                x[i] = torch.cat((box(x[i]), cls(x[i])), 1)
         return x
 
 
@@ -165,6 +189,8 @@ class YOLO(torch.nn.Module):
         self.head = Head(num_classes, (width[3], width[4], width[5]))
         self.head.stride = torch.tensor([256 / x.shape[-2] for x in self.forward(img_dummy)])
         self.stride = self.head.stride
+        self.nc = num_classes
+        self.no = self.head.no
 
     def forward(self, x):
         p3, p4, p5 = self.net(x)
@@ -185,11 +211,14 @@ class QAT(torch.nn.Module):
         self.stride = self.model.stride
 
     def forward(self, x):
-        x = self.quant(x)
-        x = self.model(x)
+        if self.training:
+            x = self.quant(x)
+            x = self.model(x)
 
-        for i in range(len(x)):
-            x[i] = self.de_quant(x[i])
+            for i in range(len(x)):
+                x[i] = self.de_quant(x[i])
+        else:
+            x = self.model(x)
         return x
 
 
