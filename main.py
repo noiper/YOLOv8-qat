@@ -262,6 +262,22 @@ def profile(args, params):
     print(f'Parameters: {params}')
 
 
+def verify(args, params):
+    """
+    Verifies the provided model against the COCO dataset.
+    """
+    model = nn.yolo_v8_n(len(params['names']))
+    state = torch.load('./weights/v8_n.pth')['model']
+    model.load_state_dict(state.float().state_dict())
+
+    mean_ap, _, _, _ = test(args, params, model)
+
+    # The official mAP for yolov8n is 37.3
+    if abs(mean_ap * 100 - 37.3) < 1:
+        print(f'Verification successful! The model mAP ({mean_ap:.3f}) is close to the expected 37.3.')
+    else:
+        print(f'Verification failed. The model mAP ({mean_ap:.3f}) is not close to the expected 37.3.')
+
 def main():
     parser = ArgumentParser()
     parser.add_argument('--input-size', default=640, type=int)
@@ -269,7 +285,8 @@ def main():
     parser.add_argument('--epochs', default=20, type=int)
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--test', action='store_true')
-    parser.add_argument('--float', action='store_true')
+    parser.add_argument('--verify', action='store_true', help='Verify the provided v8_n.pth model')
+
 
     args = parser.parse_args()
 
@@ -285,6 +302,8 @@ def main():
         train(args, params)
     if args.test:
         test(args, params)
+    if args.verify:
+        verify(args, params)
 
 
 if __name__ == "__main__":
