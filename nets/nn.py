@@ -213,13 +213,13 @@ class QAT(torch.nn.Module):
     def forward(self, x):
         if self.training:
             x = self.quant(x)
-            x = self.model(x)
-
-            for i in range(len(x)):
-                x[i] = self.de_quant(x[i])
+            # Use a new variable 'outputs' for the model's list output
+            outputs = self.model(x)
+            # Use a list comprehension for a cleaner dequantization step
+            return [self.de_quant(out) for out in outputs]
         else:
-            x = self.model(x)
-        return x
+            # The non-training path is fine as it doesn't re-assign x
+            return self.model(x)
 
 
 def yolo_v8_n(num_classes: int = 80):

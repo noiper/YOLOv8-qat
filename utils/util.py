@@ -400,12 +400,7 @@ class YOLODetector:
 
 
 class Assigner:
-    """
-    A task-aligned assigner for object detection
-    """
-
     def __init__(self, top_k=13, num_classes=80, alpha=1.0, beta=6.0, eps=1e-9):
-        super().__init__()
         self.top_k = top_k
         self.num_classes = num_classes
         self.bg_idx = num_classes
@@ -414,113 +409,108 @@ class Assigner:
         self.eps = eps
 
     @torch.no_grad()
-    def __call__(self, pred_scores, pred_boxes, anchors, true_labels, true_boxes, mask_gt):
-        size = pred_scores.size(0)
-        num_max_boxes = true_boxes.size(1)
-        if num_max_boxes == 0:
-            device = true_boxes.device
-            return (torch.full_like(pred_scores[..., 0], self.bg_idx).to(device),
-                    torch.zeros_like(pred_boxes).to(device),
-                    torch.zeros_like(pred_scores).to(device),
-                    torch.zeros_like(pred_scores[..., 0]).to(device),
-                    torch.zeros_like(pred_scores[..., 0]).to(device))
+    def __call__(self, pred_scores, pred_bboxes, anchors, gt_labels, gt_bboxes, mask_gt):
+        num_gt = gt_labels.size(1)
+        if num_gt == 0:
+            device = gt_bboxes.device
+            return (torch.full_like(pred_scores[..., 0], self.bg_idx),
+                    torch.zeros_like(pred_bboxes),
+                    torch.zeros_like(pred_scores),
+                    torch.zeros_like(pred_scores[..., 0]).bool())
 
-        num_anchors = anchors.shape[0]
-        lt, rb = true_boxes.view(-1, 1, 4).chunk(2, 2)
-        bbox_deltas = torch.cat((anchors[None] - lt, rb - anchors[None]), dim=2)
-        bbox_deltas = bbox_deltas.view(true_boxes.shape[0], true_boxes.shape[1], num_anchors, -1)
-        mask_in_gts = bbox_deltas.amin(3).gt_(1E-9)
-        na = pred_boxes.shape[-2]
-        mask_true = (mask_in_gts * mask_gt).bool()
-        overlaps = torch.zeros([size, num_max_boxes, na], dtype=pred_boxes.dtype, device=pred_boxes.device)
-        bbox_scores = torch.zeros([size, num_max_boxes, na], dtype=pred_scores.dtype, device=pred_scores.device)
-        ind = torch.zeros([2, size, num_max_boxes], dtype=torch.long)
-        ind[0] = torch.arange(end=size).view(-1, 1).expand(-1, num_max_boxes)
-        ind[1] = true_labels.squeeze(-1)
-        bbox_scores[mask_true] = pred_scores[ind[0], :, ind[1]][mask_true]
-
-        pd_boxes = pred_boxes.unsqueeze(1).expand(-1, num_max_boxes, -1, -1)[mask_true]
-        gt_boxes = true_boxes.unsqueeze(2).expand(-1, -1, na, -1)[mask_true]
-        overlaps[mask_true] = compute_iou(gt_boxes, pd_boxes).squeeze(-1).clamp_(0)
-
-        align_metric = bbox_scores.pow(self.alpha) * overlaps.pow(self.beta)
-        top_k_metrics, top_k_indices = torch.topk(align_metric, self.top_k, dim=-1, largest=True)
-
-        top_k_mask = mask_gt.expand(-1, -1, self.top_k).bool()
-        top_k_indices.masked_fill_(~top_k_mask, 0)
-
-        mask = torch.zeros(align_metric.shape, dtype=torch.int8, device=top_k_indices.device)
-        ones = torch.ones_like(top_k_indices[:, :, :1], dtype=torch.int8, device=top_k_indices.device)
-        for k in range(self.top_k):
-            mask.scatter_add_(-1, top_k_indices[:, :, k:k + 1], ones)
-        mask.masked_fill_(mask > 1, 0)
-
-        mask_top_k = mask.to(align_metric.dtype)
-        mask_pos = mask_top_k * mask_in_gts * mask_gt
-
-        fg_mask = mask_pos.sum(-2)
-        if fg_mask.max() > 1:
-            mask_multi_gts = (fg_mask.unsqueeze(1) > 1).expand(-1, num_max_boxes, -1)
-            max_overlaps_idx = overlaps.argmax(1)
-
-            is_max_overlaps = torch.zeros(mask_pos.shape, dtype=mask_pos.dtype, device=mask_pos.device)
-            is_max_overlaps.scatter_(1, max_overlaps_idx.unsqueeze(1), 1)
-
-            mask_pos = torch.where(mask_multi_gts, is_max_overlaps, mask_pos).float()
-            fg_mask = mask_pos.sum(-2)
-        target_gt_idx = mask_pos.argmax(-2)
-
-        indices = torch.arange(end=size, dtype=torch.int64, device=true_labels.device)[..., None]
-        target_index = target_gt_idx + indices * num_max_boxes
-        target_labels = true_labels.long().flatten()[target_index]
-
-        target_bboxes = true_boxes.view(-1, 4)[target_index]
-
-        target_labels.clamp_(0)
-
-        target_scores = torch.zeros((target_labels.shape[0], target_labels.shape[1], self.num_classes),
-                                    dtype=torch.int64,
-                                    device=target_labels.device)
-        target_scores.scatter_(2, target_labels.unsqueeze(-1), 1)
-
-        fg_scores_mask = fg_mask[:, :, None].repeat(1, 1, self.num_classes)
-        target_scores = torch.where(fg_scores_mask > 0, target_scores, 0)
-
+        mask_pos, align_metric, overlaps = self.get_pos_mask(
+            pred_scores, pred_bboxes, gt_labels, gt_bboxes, anchors, mask_gt)
+        target_gt_idx, fg_mask, mask_pos = self.select_highest_overlaps(mask_pos, overlaps, num_gt)
+        target_labels, target_bboxes, target_scores = self.get_targets(gt_labels, gt_bboxes, target_gt_idx, fg_mask)
+        
         align_metric *= mask_pos
         pos_align_metrics = align_metric.amax(axis=-1, keepdim=True)
         pos_overlaps = (overlaps * mask_pos).amax(axis=-1, keepdim=True)
         norm_align_metric = (align_metric * pos_overlaps / (pos_align_metrics + self.eps)).amax(-2).unsqueeze(-1)
         target_scores = target_scores * norm_align_metric
 
-        return target_bboxes, target_scores, fg_mask.bool(), target_gt_idx
+        return target_labels, target_bboxes, target_scores, fg_mask.bool()
+
+    def get_pos_mask(self, pred_scores, pred_bboxes, gt_labels, gt_bboxes, anchors, mask_gt):
+        align_metric, overlaps = self.get_box_metrics(pred_scores, pred_bboxes, gt_labels, gt_bboxes)
+        mask_in_gts = self.select_candidates_in_gts(anchors, gt_bboxes)
+        mask_top_k = self.select_top_k_candidates(align_metric * mask_in_gts, top_k_mask=mask_gt.repeat([1, 1, self.top_k]).bool())
+        mask_pos = mask_top_k * mask_in_gts * mask_gt
+        return mask_pos, align_metric, overlaps
+
+    def get_box_metrics(self, pred_scores, pred_bboxes, gt_labels, gt_bboxes):
+        bs, n_max_boxes, _ = gt_labels.shape
+        na = pred_bboxes.size(1)
+        
+        b_idx = torch.arange(bs, device=pred_scores.device).view(bs, 1, 1).expand(bs, n_max_boxes, na)
+        j_idx = torch.arange(na, device=pred_scores.device).view(1, 1, na).expand(bs, n_max_boxes, na)
+        class_idx = gt_labels.long().expand(bs, n_max_boxes, na)
+        bbox_scores = pred_scores[b_idx, j_idx, class_idx]
+
+        overlaps = compute_iou(gt_bboxes.unsqueeze(2).expand(-1, -1, na, -1), pred_bboxes.unsqueeze(1).expand(-1, n_max_boxes, -1, -1))
+        align_metric = bbox_scores.pow(self.alpha) * overlaps.pow(self.beta)
+        return align_metric, overlaps
+
+    def select_candidates_in_gts(self, anchors, gt_bboxes):
+        n_anchors = anchors.shape[0]
+        lt, rb = gt_bboxes.view(-1, 1, 4).chunk(2, 2)
+        bbox_deltas = torch.cat((anchors[None] - lt, rb - anchors[None]), dim=2).view(gt_bboxes.shape[0], gt_bboxes.shape[1], n_anchors, -1)
+        return bbox_deltas.amin(3).gt_(1e-9)
+
+    def select_top_k_candidates(self, metrics, largest=True, top_k_mask=None):
+        top_k_metrics, top_k_indices = torch.topk(metrics, self.top_k, dim=-1, largest=largest)
+        if top_k_mask is None:
+            top_k_mask = (top_k_metrics.max(-1, keepdim=True) > self.eps).tile([1, 1, self.top_k])
+        top_k_indices.masked_fill_(~top_k_mask, 0)
+        one_hot_pk = torch.zeros(metrics.shape, dtype=metrics.dtype, device=metrics.device)
+        one_hot_pk.scatter_(-1, top_k_indices, 1)
+        return one_hot_pk
+
+    def get_targets(self, gt_labels, gt_bboxes, target_gt_idx, fg_mask):
+        batch_ind = torch.arange(gt_labels.size(0), dtype=torch.int64, device=gt_labels.device)[..., None]
+        target_gt_idx = target_gt_idx + batch_ind * gt_labels.size(1)
+        target_labels = gt_labels.long().flatten()[target_gt_idx]
+        target_bboxes = gt_bboxes.view(-1, 4)[target_gt_idx]
+        target_labels.clamp_(0)
+        
+        target_scores = torch.zeros((target_labels.shape[0], target_labels.shape[1], self.num_classes),
+                                    dtype=torch.float32, device=target_labels.device)
+        target_scores.scatter_(2, target_labels.unsqueeze(-1), 1)
+        
+        fg_scores_mask = fg_mask[:, :, None].repeat(1, 1, self.num_classes)
+        target_scores = torch.where(fg_scores_mask > 0, target_scores, 0)
+        return target_labels, target_bboxes, target_scores
+
+    def select_highest_overlaps(self, mask_pos, overlaps, num_gt):
+        fg_mask = mask_pos.sum(-2)
+        if fg_mask.max() > 1:
+            mask_multi_gts = (fg_mask.unsqueeze(1) > 1).repeat([1, num_gt, 1])
+            max_overlaps_idx = overlaps.argmax(1)
+            is_max_overlaps = torch.zeros(mask_pos.shape, dtype=mask_pos.dtype, device=mask_pos.device)
+            is_max_overlaps.scatter_(1, max_overlaps_idx.unsqueeze(1), 1)
+            mask_pos = torch.where(mask_multi_gts, is_max_overlaps, mask_pos).float()
+            fg_mask = mask_pos.sum(-2)
+        target_gt_idx = mask_pos.argmax(-2)
+        return target_gt_idx, fg_mask, mask_pos
 
 
 class BoxLoss(torch.nn.Module):
     def __init__(self):
         super().__init__()
 
-    @staticmethod
-    def forward(pred_bboxes, target_bboxes, target_scores, target_scores_sum, fg_mask):
+    def forward(self, pred_bboxes, target_bboxes, target_scores, target_scores_sum, fg_mask):
         weight = torch.masked_select(target_scores.sum(-1), fg_mask).unsqueeze(-1)
         iou = compute_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask])
-
         return ((1.0 - iou) * weight).sum() / target_scores_sum
 
 
 class ComputeLoss:
     def __init__(self, model, params):
-        super().__init__()
         if hasattr(model, 'module'):
             model = model.module
-
         device = next(model.parameters()).device
-
-        self.no = model.no
-        self.nc = model.nc
-        self.params = params
-        self.device = device
-        self.stride = model.stride
-
+        self.no, self.nc, self.stride = model.no, model.nc, model.stride
+        self.params, self.device = params, device
         self.box_loss = BoxLoss().to(device)
         self.cls_loss = torch.nn.BCEWithLogitsLoss(reduction='none')
         self.assigner = Assigner(top_k=10, num_classes=self.nc, alpha=0.5, beta=6.0)
@@ -528,26 +518,21 @@ class ComputeLoss:
     def __call__(self, outputs, targets):
         shape = outputs[0].shape
         x_cat = torch.cat([i.view(shape[0], self.no, -1) for i in outputs], 2)
-        pred_distri, pred_scores = torch.split(x_cat, split_size_or_sections=(4, self.nc), dim=1)
-
+        pred_distri, pred_scores = torch.split(x_cat, (4, self.nc), 1)
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_distri = pred_distri.permute(0, 2, 1).contiguous()
 
-        size = torch.tensor(shape[2:], device=self.device, dtype=pred_scores.dtype)
-        size = size * self.stride[0]
+        size = torch.tensor(shape[2:], device=self.device, dtype=pred_scores.dtype) * self.stride[0]
         anchors, strides = make_anchors(outputs, self.stride, 0.5)
 
-        # targets
         indices = targets['idx'].view(-1, 1)
         batch_size = pred_scores.shape[0]
-        box_targets = torch.cat((indices, targets['cls'].view(-1, 1), targets['box']), 1)
-        box_targets = box_targets.to(self.device)
-        if box_targets.shape[0] == 0:
-            true = torch.zeros(batch_size, 0, 5, device=self.device)
-        else:
+        box_targets = torch.cat((indices, targets['cls'].view(-1, 1), targets['box']), 1).to(self.device)
+        
+        true = torch.zeros(batch_size, 0, 5, device=self.device)
+        if box_targets.shape[0] > 0:
             i = box_targets[:, 0]
             _, counts = i.unique(return_counts=True)
-            counts = counts.to(dtype=torch.int32)
             true = torch.zeros(batch_size, counts.max(), 5, device=self.device)
             for j in range(batch_size):
                 matches = i == j
@@ -556,45 +541,34 @@ class ComputeLoss:
                     true[j, :n] = box_targets[matches, 1:]
             x = true[..., 1:5].mul_(size[[1, 0, 1, 0]])
             y = x.clone()
-            y[..., 0] = x[..., 0] - x[..., 2] / 2  # top left x
-            y[..., 1] = x[..., 1] - x[..., 3] / 2  # top left y
-            y[..., 2] = x[..., 0] + x[..., 2] / 2  # bottom right x
-            y[..., 3] = x[..., 1] + x[..., 3] / 2  # bottom right y
+            y[..., 0], y[..., 1] = x[..., 0] - x[..., 2] / 2, x[..., 1] - x[..., 3] / 2
+            y[..., 2], y[..., 3] = x[..., 0] + x[..., 2] / 2, x[..., 1] + x[..., 3] / 2
             true[..., 1:5] = y
+            
         gt_labels, gt_bboxes = true.split((1, 4), 2)
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0)
-
         pred_bboxes = self.box_decode(anchors, pred_distri)
-
+        
         scores = pred_scores.detach().sigmoid()
         bboxes = (pred_bboxes.detach() * strides).type(gt_bboxes.dtype)
-        target_bboxes, target_scores, fg_mask, _ = self.assigner(scores, bboxes,
-                                                                 anchors * strides,
-                                                                 gt_labels, gt_bboxes, mask_gt)
-
+        
+        _, target_bboxes, target_scores, fg_mask = self.assigner(scores, bboxes, anchors * strides, gt_labels, gt_bboxes, mask_gt)
+        
         target_scores_sum = max(target_scores.sum(), 1)
-
-        # cls loss
-        loss_cls = self.cls_loss(pred_scores, target_scores.to(pred_scores.dtype)).sum()
-        loss_cls = loss_cls / target_scores_sum
-
-        # box loss
+        
+        loss_cls = self.cls_loss(pred_scores, target_scores).sum() / target_scores_sum
+        
         loss_box = torch.zeros(1, device=self.device)
         if fg_mask.sum():
             target_bboxes /= strides
-            loss_box = self.box_loss(pred_bboxes,
-                                     target_bboxes,
-                                     target_scores,
-                                     target_scores_sum, fg_mask)
-
-        loss_box *= self.params['box']  # box gain
-        loss_cls *= self.params['cls']  # cls gain
-
+            loss_box = self.box_loss(pred_bboxes, target_bboxes, target_scores, target_scores_sum, fg_mask)
+            
+        loss_box *= self.params['box']
+        loss_cls *= self.params['cls']
         return loss_box, loss_cls
 
     @staticmethod
     def box_decode(anchor_points, pred_dist):
         a, b = pred_dist.chunk(2, -1)
-        a = anchor_points - a
-        b = anchor_points + b
+        a, b = anchor_points - a, anchor_points + b
         return torch.cat((a, b), -1)
