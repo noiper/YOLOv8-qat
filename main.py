@@ -30,19 +30,18 @@ def train(args, params):
 
     # Model
     model = nn.yolo_v8_n(len(params['names']))
-    if not args.float:
-        state = torch.load('./weights/v8_n.pth')['model']
-        model.load_state_dict(state.float().state_dict())
-        model.eval()
+    state = torch.load('./weights/v8_n.pth')['model']
+    model.load_state_dict(state.float().state_dict())
+    model.eval()
 
-        for m in model.modules():
-            if type(m) is nn.Conv and hasattr(m, 'norm'):
-                torch.ao.quantization.fuse_modules(m, [["conv", "norm"]], True)
-        model.train()
+    for m in model.modules():
+        if type(m) is nn.Conv and hasattr(m, 'norm'):
+            torch.ao.quantization.fuse_modules(m, [["conv", "norm"]], True)
+    model.train()
 
-        model = nn.QAT(model)
-        model.qconfig = torch.quantization.get_default_qconfig("qnnpack")
-        torch.quantization.prepare_qat(model, inplace=True)
+    model = nn.QAT(model)
+    model.qconfig = torch.quantization.get_default_qconfig("qnnpack")
+    torch.quantization.prepare_qat(model, inplace=True)
     model.cuda()
 
     # Optimizer
@@ -147,8 +146,7 @@ def train(args, params):
             save = copy.deepcopy(model)
             save.eval()
             save.to(torch.device('cpu'))
-            if not args.float:
-                torch.ao.quantization.convert(save, inplace=True)
+            torch.ao.quantization.convert(save, inplace=True)
             # mAP
             last = test(args, params, save)
 
@@ -261,7 +259,6 @@ def profile(args, params):
     print(f'MACs: {macs}')
     print(f'Parameters: {params}')
 
-
 def verify(args, params):
     """
     Verifies the provided model against the COCO dataset.
@@ -277,6 +274,7 @@ def verify(args, params):
         print(f'Verification successful! The model mAP ({mean_ap:.3f}) is close to the expected 37.3.')
     else:
         print(f'Verification failed. The model mAP ({mean_ap:.3f}) is not close to the expected 37.3.')
+
 
 def main():
     parser = ArgumentParser()
