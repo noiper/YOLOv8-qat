@@ -60,9 +60,6 @@ def train(args, params):
         for filename in reader.readlines():
             filename = filename.rstrip().split('/')[-1]
             filenames.append('../datasets/coco/images/train2017/' + filename)
-
-    # --- REMOVE THIS ---
-    # filenames = filenames[:1000]  # Use only the first 1000 images
     
     dataset = Dataset(filenames, args.input_size, params, True)
     loader = data.DataLoader(dataset, args.batch_size, shuffle=True,
