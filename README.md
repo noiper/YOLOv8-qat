@@ -14,7 +14,8 @@ pip install tqdm
 ### Train
 
 * Configure your dataset path in `main.py` for training
-* Run `bash main.sh $ --train` for training, `$` is number of GPUs
+* Run `python main.py --train` for QAT.
+* Run `python main.py --train --float` for training in full precision.
 
 ### Test
 
