@@ -24,67 +24,27 @@ def learning_rate(args, params):
     return fn
 
 
-def train(args, params):
+def train(args, params, float_mode=False):
     util.setup_seed()
     util.setup_multi_processes()
 
-# Model
-    model = nn.yolo_v8_s(len(params['names']))
+    # Model
+    model = nn.yolo_v8_n(len(params['names']))
+    state = torch.load('./weights/v8_n.pth')['model']
+    model.load_state_dict(state.float().state_dict())
     
-    # Load the official yolov8s.pt weights
-    state = torch.load('./weights/v8_s.pth', map_location='cpu')['model']
+    if not float_mode:
+        model.eval()
+
+        for m in model.modules():
+            if type(m) is nn.Conv and hasattr(m, 'norm'):
+                torch.ao.quantization.fuse_modules(m, [["conv", "norm"]], True)
+        model.train()
+
+        model = nn.QAT(model)
+        model.qconfig = torch.quantization.get_default_qconfig("qnnpack")
+        torch.quantization.prepare_qat(model, inplace=True)
     
-    # Create a new state dictionary with matching keys
-    new_state_dict = {}
-    for k, v in state.state_dict().items():
-        # The key names in this project are slightly different from the official ones.
-        # This loop renames the keys to match the current model structure.
-        name = k.replace('model.', 'net.') # replace "model" with "net"
-        # The official model uses integer indexing, but this project uses p1, p2, etc.
-        # This part of the code is a bit of a hack to remap the keys, but it works for this model.
-        if '.2.' in name: name = name.replace('.2.', '.p2.1.')
-        if '.3.' in name: name = name.replace('.3.', '.p3.0.')
-        if '.4.' in name: name = name.replace('.4.', '.p3.1.')
-        if '.5.' in name: name = name.replace('.5.', '.p4.0.')
-        if '.6.' in name: name = name.replace('.6.', '.p4.1.')
-        if '.7.' in name: name = name.replace('.7.', '.p5.0.')
-        if '.8.' in name: name = name.replace('.8.', '.p5.1.')
-        if '.9.' in name: name = name.replace('.9.', '.p5.2.')
-        
-        # FPN remapping
-        if '12.' in name: name = name.replace('12.', 'fpn.h1.')
-        if '15.' in name: name = name.replace('15.', 'fpn.h2.')
-        if '16.' in name: name = name.replace('16.', 'fpn.h3.')
-        if '18.' in name: name = name.replace('18.', 'fpn.h4.')
-        if '19.' in name: name = name.replace('19.', 'fpn.h5.')
-        if '21.' in name: name = name.replace('21.', 'fpn.h6.')
-        
-        # Head remapping
-        if 'cv2.0.' in name: name = name.replace('cv2.0.', 'box.0.')
-        if 'cv2.1.' in name: name = name.replace('cv2.1.', 'box.1.')
-        if 'cv2.2.' in name: name = name.replace('cv2.2.', 'box.2.')
-        if 'cv3.0.' in name: name = name.replace('cv3.0.', 'cls.0.')
-        if 'cv3.1.' in name: name = name.replace('cv3.1.', 'cls.1.')
-        if 'cv3.2.' in name: name = name.replace('cv3.2.', 'cls.2.')
-
-        # BN layer remapping
-        if 'bn.' in name: name = name.replace('bn.', 'norm.')
-        
-        new_state_dict[name] = v
-
-    # Load the new state dictionary into the model
-    model.load_state_dict(new_state_dict, strict=False)
-
-    model.eval()
-
-    for m in model.modules():
-        if type(m) is nn.Conv and hasattr(m, 'norm'):
-            torch.ao.quantization.fuse_modules(m, [["conv", "norm"]], True)
-    model.train()
-
-    model = nn.QAT(model)
-    model.qconfig = torch.quantization.get_default_qconfig("qnnpack")
-    torch.quantization.prepare_qat(model, inplace=True)
     model.cuda()
 
     # Optimizer
@@ -103,9 +63,6 @@ def train(args, params):
         for filename in reader.readlines():
             filename = filename.rstrip().split('/')[-1]
             filenames.append('../datasets/coco/images/train2017/' + filename)
-
-    # --- REMOVE THIS ---
-    # filenames = filenames[:1000]  # Use only the first 1000 images
     
     dataset = Dataset(filenames, args.input_size, params, True)
     loader = data.DataLoader(dataset, args.batch_size, shuffle=True,
@@ -184,34 +141,62 @@ def train(args, params):
 
             # Scheduler
             scheduler.step()
+            
+            if not float_mode:
+                # Convert model
+                save = copy.deepcopy(model)
+                save.eval()
+                save.to(torch.device('cpu'))
+                torch.ao.quantization.convert(save, inplace=True)
+                # mAP
+                last = test(args, params, save)
 
-            # Convert model
-            save = copy.deepcopy(model)
-            save.eval()
-            save.to(torch.device('cpu'))
-            torch.ao.quantization.convert(save, inplace=True)
-            # mAP
-            last = test(args, params, save)
+                writer.writerow({'epoch': str(epoch + 1).zfill(3),
+                                'box': str(f'{avg_box_loss.avg:.3f}'),
+                                'cls': str(f'{avg_cls_loss.avg:.3f}'),
+                                'mAP': str(f'{last[0]:.3f}'),
+                                'mAP@50': str(f'{last[1]:.3f}'),
+                                'Recall': str(f'{last[2]:.3f}'),
+                                'Precision': str(f'{last[2]:.3f}')})
+                f.flush()
 
-            writer.writerow({'epoch': str(epoch + 1).zfill(3),
-                            'box': str(f'{avg_box_loss.avg:.3f}'),
-                            'cls': str(f'{avg_cls_loss.avg:.3f}'),
-                            'mAP': str(f'{last[0]:.3f}'),
-                            'mAP@50': str(f'{last[1]:.3f}'),
-                            'Recall': str(f'{last[2]:.3f}'),
-                            'Precision': str(f'{last[2]:.3f}')})
-            f.flush()
+                # Update best mAP
+                if last[0] > best:
+                    best = last[0]
 
-            # Update best mAP
-            if last[0] > best:
-                best = last[0]
+                # Save last, best and delete
+                save = torch.jit.script(save.cpu())
+                torch.jit.save(save, './weights/last.ts')
+                if best == last[0]:
+                    torch.jit.save(save, './weights/best.ts')
+                del save
+            else:
+                # mAP
+                last = test(args, params, model.module if hasattr(model, 'module') else model)
 
-            # Save last, best and delete
-            save = torch.jit.script(save.cpu())
-            torch.jit.save(save, './weights/last.ts')
-            if best == last[0]:
-                torch.jit.save(save, './weights/best.ts')
-            del save
+                writer.writerow({'epoch': str(epoch + 1).zfill(3),
+                                 'box': str(f'{avg_box_loss.avg:.3f}'),
+                                 'cls': str(f'{avg_cls_loss.avg:.3f}'),
+                                 'mAP': str(f'{last[0]:.3f}'),
+                                 'mAP@50': str(f'{last[1]:.3f}'),
+                                 'Recall': str(f'{last[2]:.3f}'),
+                                 'Precision': str(f'{last[2]:.3f}')})
+                f.flush()
+
+                # Update best mAP
+                if last[0] > best:
+                    best = last[0]
+
+                # Save last, best and delete
+                ckpt = {'epoch': epoch,
+                        'best_fitness': best,
+                        'model': copy.deepcopy(model.module if hasattr(model, 'module') else model).half()}
+
+                torch.save(ckpt, './weights/last.pt')
+                if best == last[0]:
+                    torch.save(ckpt, './weights/best.pt')
+                del ckpt
+
 
     torch.cuda.empty_cache()
 
@@ -229,8 +214,10 @@ def test(args, params, model=None):
                              pin_memory=True, collate_fn=Dataset.collate_fn)
     if model is None:
         model = torch.jit.load(f='./weights/best.ts')
+        device = torch.device('cpu')
+    else:
+        device = next(model.parameters()).device
 
-    device = torch.device('cpu')
     model.to(device)
     model.eval()
 
@@ -289,7 +276,7 @@ def test(args, params, model=None):
 
 def profile(args, params):
     from thop import profile, clever_format
-    model = nn.yolo_v8_s(len(params['names']))
+    model = nn.yolo_v8_n(len(params['names']))
     shape = (1, 3, args.input_size, args.input_size)
 
     model.eval()
@@ -302,6 +289,22 @@ def profile(args, params):
     print(f'MACs: {macs}')
     print(f'Parameters: {params}')
 
+def verify(args, params):
+    """
+    Verifies the provided model against the COCO dataset.
+    """
+    model = nn.yolo_v8_n(len(params['names']))
+    state = torch.load('./weights/v8_n.pth')['model']
+    model.load_state_dict(state.float().state_dict())
+
+    mean_ap, _, _, _ = test(args, params, model)
+
+    # The official mAP for yolov8n is 37.3
+    if abs(mean_ap * 100 - 37.3) < 1:
+        print(f'Verification successful! The model mAP ({mean_ap:.3f}) is close to the expected 37.3.')
+    else:
+        print(f'Verification failed. The model mAP ({mean_ap:.3f}) is not close to the expected 37.3.')
+
 
 def main():
     parser = ArgumentParser()
@@ -310,6 +313,9 @@ def main():
     parser.add_argument('--epochs', default=20, type=int)
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--test', action='store_true')
+    parser.add_argument('--verify', action='store_true', help='Verify the provided v8_n.pth model')
+    parser.add_argument('--float', action='store_true', help='Enable floating point training')
+
 
     args = parser.parse_args()
 
@@ -322,9 +328,11 @@ def main():
         params = yaml.safe_load(f)
     profile(args, params)
     if args.train:
-        train(args, params)
+        train(args, params, float_mode=args.float)
     if args.test:
         test(args, params)
+    if args.verify:
+        verify(args, params)
 
 
 if __name__ == "__main__":
