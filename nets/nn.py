@@ -2,6 +2,11 @@ import torch
 
 from utils.util import make_anchors
 
+"""
+x.is_quantized is false during training.
+torch.nn.quantized.FloatFunctional() gives true quantization.
+"""
+
 
 class SiLU(torch.nn.Module):
     def __init__(self):
@@ -199,6 +204,13 @@ class YOLO(torch.nn.Module):
 
 
 class QAT(torch.nn.Module):
+    """
+    Input data shape is (batch, 3, height, width)
+    By default, height and width are 640.
+    QuantStub acts as a placeholder to mark where quantization should happen in your model. 
+    It doesn't perform the quantization itself during a normal forward pass; it just tells 
+    PyTorch's quantization tools where to insert the conversion logic later.
+    """
 
     def __init__(self, model):
         super().__init__()
